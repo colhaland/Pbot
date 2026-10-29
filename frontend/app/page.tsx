@@ -18,6 +18,7 @@ import {
   ListChecks,
   LogOut,
   Plus,
+  Pencil,
   RefreshCw,
   Search,
   ShieldCheck,
@@ -28,13 +29,17 @@ import {
 import { FormEvent, useCallback, useEffect, useState } from "react";
 
 type Role = "owner" | "operator" | "viewer";
-type User = { id: string; email: string; role: Role };
+type User = { id: string; email: string; role: Role; totp_enabled?: boolean };
 type BootstrapStatus = { initialized: boolean; bootstrap_configured: boolean; needs_bootstrap: boolean };
 type Website = {
   id: string;
   name: string;
   base_url: string;
+  login_url?: string;
+  dashboard_url?: string;
   adapter_id: string;
+  adapter_version?: string;
+  adapter_config?: Record<string, unknown>;
   status: "active" | "disabled" | "needs_attention";
   allowed_actions: string[];
 };
@@ -48,6 +53,14 @@ type Job = {
   last_error_code?: string | null;
   last_error_message?: string | null;
 };
+type JobArtifact = {
+  id: string;
+  kind: string;
+  checksum_sha256: string;
+  size_bytes: number;
+  expires_at: string;
+  url?: string;
+};
 type Approval = {
   id: string;
   job_id: string;
@@ -57,8 +70,8 @@ type Approval = {
   approval_hash: string;
   expires_at: string;
 };
-type Section = "overview" | "websites" | "jobs" | "approvals" | "schedules" | "ai" | "audit" | "telegram";
-type Schedule = { id: string; name: string; website_id: string; action: string; cron_expr: string; timezone: string; is_active: boolean; next_run_at: string };
+type Section = "overview" | "websites" | "jobs" | "approvals" | "schedules" | "ai" | "audit" | "telegram" | "security";
+type Schedule = { id: string; name: string; website_id: string; action: string; payload: Record<string, unknown>; cron_expr: string; timezone: string; is_active: boolean; misfire_policy: string; next_run_at: string };
 type AISettings = { configured: boolean; api_key_masked: string | null; primary_model_id: string | null; fallback_model_id: string | null; temperature: number; max_output_tokens: number; timeout_seconds: number; mode: string; allow_ai_write_proposals: boolean; system_instruction: string; status: string };
 type AIModel = { id: string; display_name: string; input_token_limit: number | null; output_token_limit: number | null };
 type TelegramUser = { telegram_user_id: number; display_name: string; role: Role; is_active: boolean };
@@ -78,6 +91,7 @@ const navItems: { id: Section; label: string; icon: typeof LayoutDashboard }[] =
   { id: "ai", label: "Pengaturan AI", icon: Bot },
   { id: "audit", label: "Audit log", icon: FileClock },
   { id: "telegram", label: "Pengguna Telegram", icon: Command },
+  { id: "security", label: "Keamanan akun", icon: ShieldCheck },
 ];
 
 const actionLabels: Record<string, string> = {
@@ -86,6 +100,21 @@ const actionLabels: Record<string, string> = {
   test_login: "Uji login",
   fill_form: "Isi formulir",
   submit_form: "Kirim formulir",
+};
+
+const defaultAdapterConfig = {
+  login: {
+    username_selector: "input[name='email']",
+    password_selector: "input[name='password']",
+    submit_selector: "button[type='submit']",
+    success_indicator: "[data-testid='user-menu']",
+    failure_indicator: ".alert-error",
+    manual_action_indicators: [],
+  },
+  extract: { fields: {} },
+  pages: {},
+  sensitive_selectors: ["input[type='password']"],
+  forms: {},
 };
 
 const statusLabels: Record<string, string> = {
@@ -145,7 +174,14 @@ export default function Home() {
   const [totpRequired, setTotpRequired] = useState(false);
   const [search, setSearch] = useState("");
   const [websiteFormOpen, setWebsiteFormOpen] = useState(false);
+  const [editingWebsite, setEditingWebsite] = useState<Website | null>(null);
+  const [editingSchedule, setEditingSchedule] = useState<Schedule | null>(null);
   const [jobFormOpen, setJobFormOpen] = useState(false);
+  const [selectedJob, setSelectedJob] = useState<Job | null>(null);
+  const [jobArtifacts, setJobArtifacts] = useState<JobArtifact[]>([]);
+  const [jobDetailBusy, setJobDetailBusy] = useState(false);
+  const [totpSecret, setTotpSecret] = useState<string | null>(null);
+  const [totpUri, setTotpUri] = useState("");
 
   const refresh = useCallback(async () => {
     try {
@@ -269,14 +305,16 @@ export default function Home() {
       const password = String(form.get("password") || "");
       if (Boolean(username) !== Boolean(password)) throw new Error("Username dan password harus diisi bersama atau keduanya dikosongkan.");
       const adapterConfig = JSON.parse(String(form.get("adapter_config") || "{}"));
-      const created = await api<Website>("/websites", { method: "POST", body: JSON.stringify({
+      const saved = await api<Website>(editingWebsite ? `/websites/${editingWebsite.id}` : "/websites", { method: editingWebsite ? "PUT" : "POST", body: JSON.stringify({
         id: form.get("id"), name: form.get("name"), base_url: form.get("base_url"),
         login_url: form.get("login_url"), dashboard_url: form.get("dashboard_url"),
-        adapter_id: form.get("adapter_id"), adapter_version: "1.0.0", adapter_config: adapterConfig,
+        adapter_id: form.get("adapter_id"), adapter_version: editingWebsite?.adapter_version ?? "1.0.0", adapter_config: adapterConfig,
         allowed_actions: form.getAll("actions"),
       }) });
-      if (username && password) await api(`/websites/${created.id}/credentials`, { method: "PUT", body: JSON.stringify({ username, password }) });
-      setNotice("Website berhasil didaftarkan.");
+      if (username && password) await api(`/websites/${saved.id}/credentials`, { method: "PUT", body: JSON.stringify({ username, password }) });
+      setNotice(editingWebsite ? "Konfigurasi website berhasil diperbarui." : "Website berhasil didaftarkan.");
+      setEditingWebsite(null);
+      setWebsiteFormOpen(false);
       await refresh();
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "Website tidak dapat disimpan.");
@@ -323,16 +361,42 @@ export default function Home() {
     }
   }
 
+  async function inspectJob(job: Job) {
+    setJobDetailBusy(true);
+    try {
+      const [detail, artifacts] = await Promise.all([
+        api<Job>(`/jobs/${job.id}`),
+        api<JobArtifact[]>(`/jobs/${job.id}/artifacts`),
+      ]);
+      const signedArtifacts = await Promise.all(artifacts.map(async (artifact) => {
+        const signed = await api<{ url: string }>(`/artifacts/${artifact.id}/url`);
+        return { ...artifact, url: signed.url };
+      }));
+      setSelectedJob(detail);
+      setJobArtifacts(signedArtifacts);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Detail job tidak dapat dimuat.");
+    } finally {
+      setJobDetailBusy(false);
+    }
+  }
+
   async function submitSchedule(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const formElement = event.currentTarget;
     const form = new FormData(formElement);
     try {
-      await api("/schedules", { method: "POST", body: JSON.stringify({ name: form.get("name"), website_id: form.get("website_id"), action: form.get("action"), cron_expr: form.get("cron_expr"), timezone: form.get("timezone"), payload: JSON.parse(String(form.get("payload") || "{}")), is_active: true, misfire_policy: "run_once_latest" }) });
-      setNotice("Jadwal berhasil dibuat.");
+      await api(editingSchedule ? `/schedules/${editingSchedule.id}` : "/schedules", { method: editingSchedule ? "PUT" : "POST", body: JSON.stringify({ name: form.get("name"), website_id: form.get("website_id"), action: form.get("action"), cron_expr: form.get("cron_expr"), timezone: form.get("timezone"), payload: JSON.parse(String(form.get("payload") || "{}")), is_active: true, misfire_policy: editingSchedule?.misfire_policy ?? "run_once_latest" }) });
+      setNotice(editingSchedule ? "Jadwal diperbarui." : "Jadwal berhasil dibuat.");
+      setEditingSchedule(null);
       setSchedules(await api<Schedule[]>("/schedules"));
-      formElement.reset();
+        setEditingSchedule(null);
+        formElement.reset();
     } catch (error) { setNotice(error instanceof Error ? error.message : "Jadwal tidak dapat dibuat."); }
+  }
+
+  function editSchedule(schedule: Schedule) {
+    setEditingSchedule(schedule);
   }
 
   async function submitAISettings(event: FormEvent<HTMLFormElement>) {
@@ -397,11 +461,48 @@ export default function Home() {
     } catch (error) { setNotice(error instanceof Error ? error.message : "Status pengguna gagal diubah."); }
   }
 
+  async function beginTotpSetup() {
+    try {
+      const setup = await api<{ secret: string; otpauth_uri: string }>("/auth/totp/setup", { method: "POST", body: "{}" });
+      setTotpSecret(setup.secret);
+      setTotpUri(setup.otpauth_uri);
+    } catch (error) { setNotice(error instanceof Error ? error.message : "Setup TOTP tidak dapat dimulai."); }
+  }
+
+  async function confirmTotpSetup(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    try {
+      await api("/auth/totp/confirm", { method: "POST", body: JSON.stringify({ code: form.get("code") }) });
+      setUser((current) => current ? { ...current, totp_enabled: true } : current);
+      setTotpSecret(null);
+      setTotpUri("");
+      setNotice("Autentikasi dua faktor berhasil diaktifkan.");
+    } catch (error) { setNotice(error instanceof Error ? error.message : "Kode TOTP tidak valid."); }
+  }
+
+  async function disableTotpSetup(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const formElement = event.currentTarget;
+    const form = new FormData(formElement);
+    try {
+      await api("/auth/totp/disable", { method: "POST", body: JSON.stringify({ password: form.get("password"), code: form.get("code") }) });
+      setUser((current) => current ? { ...current, totp_enabled: false } : current);
+      setNotice("Autentikasi dua faktor dinonaktifkan.");
+      formElement.reset();
+    } catch (error) { setNotice(error instanceof Error ? error.message : "TOTP tidak dapat dinonaktifkan."); }
+  }
+
   async function toggleWebsite(site: Website) {
     try {
       await api(`/websites/${site.id}/status`, { method: "PATCH", body: JSON.stringify({ status: site.status === "active" ? "disabled" : "active" }) });
       await refresh();
     } catch (error) { setNotice(error instanceof Error ? error.message : "Status website gagal diubah."); }
+  }
+
+  function editWebsite(site: Website) {
+    setEditingWebsite(site);
+    setWebsiteFormOpen(true);
   }
 
   const activeSites = websites.filter((site) => site.status === "active").length;
@@ -457,6 +558,7 @@ export default function Home() {
 
         <div className="content-area">
           {notice && <div className="notice"><CircleAlert size={16} /><span>{notice}</span><button className="icon-button" title="Tutup" aria-label="Tutup pesan" onClick={() => setNotice("")}><X size={15} /></button></div>}
+          {selectedJob && <div className="modal-backdrop" role="presentation" onClick={() => setSelectedJob(null)}><section className="surface job-detail-modal" role="dialog" aria-modal="true" aria-labelledby="job-detail-title" onClick={(event) => event.stopPropagation()}><div className="form-title"><div><p className="eyebrow">DETAIL EKSEKUSI</p><h2 id="job-detail-title">{actionLabels[selectedJob.action] ?? selectedJob.action}</h2></div><button className="icon-button" aria-label="Tutup detail" onClick={() => setSelectedJob(null)}><X size={17} /></button></div><div className="job-detail-meta"><span>Job <code>{selectedJob.id}</code></span><span>Website <code>{selectedJob.website_id}</code></span><Badge value={selectedJob.status} /></div><div className="job-detail-meta"><span>Risiko <b>{selectedJob.risk_level}</b></span><span>Dibuat <b>{formatTime(selectedJob.created_at)}</b></span></div>{selectedJob.last_error_code && <div className="job-error-panel"><CircleAlert size={15} /><span><b>{selectedJob.last_error_code}</b><small>{selectedJob.last_error_message}</small></span></div>}<h3 className="artifact-heading">Artefak hasil</h3>{jobDetailBusy ? <p className="field-note">Memuat artefak...</p> : jobArtifacts.length === 0 ? <p className="field-note">Belum ada artefak untuk job ini.</p> : <div className="artifact-list">{jobArtifacts.map((artifact) => <div className="artifact-item" key={artifact.id}><div><b>{artifact.kind === "screenshot" ? "Screenshot" : "Data ekstraksi"}</b><small>{(artifact.size_bytes / 1024).toFixed(1)} KB · SHA-256 {artifact.checksum_sha256.slice(0, 12)}…</small></div><a className="button button-quiet button-small" href={artifact.url} target="_blank" rel="noreferrer">{artifact.kind === "screenshot" ? "Buka gambar" : "Unduh JSON"}<ArrowUpRight size={13} /></a>{artifact.kind === "screenshot" && artifact.url && <img className="artifact-preview" src={artifact.url} alt={`Screenshot job ${selectedJob.id}`} />}</div>)}</div>}<div className="form-actions"><button className="button button-quiet" onClick={() => setSelectedJob(null)}>Tutup</button></div></section></div>}
 
           {section === "overview" && <>
             <div className="page-heading"><div><p className="eyebrow">KAMIS, 29 OKTOBER 2026 <span className="heading-dot" /> WORKSPACE OVERVIEW</p><h1>Selamat datang kembali.</h1><p className="page-subtitle">Pantau aktivitas otomasi dan tindak lanjuti yang membutuhkan perhatian.</p></div><button className="button button-dark" onClick={() => setSection("websites")}><Plus size={16} /> Tambah website</button></div>
@@ -468,7 +570,7 @@ export default function Home() {
             </div>
             <div className="overview-grid">
               <section className="surface activity-surface"><div className="section-header"><div><p className="eyebrow">OPERASIONAL</p><h2>Aktivitas terbaru</h2></div><button className="text-button" onClick={() => setSection("jobs")}>Semua job <ArrowRight size={14} /></button></div>
-                {jobs.length === 0 ? <EmptyState title="Belum ada aktivitas" detail="Job yang dibuat akan muncul di sini." /> : <div className="activity-list">{jobs.slice(0, 6).map((job) => <JobRow key={job.id} job={job} />)}</div>}
+                {jobs.length === 0 ? <EmptyState title="Belum ada aktivitas" detail="Job yang dibuat akan muncul di sini." /> : <div className="activity-list">{jobs.slice(0, 6).map((job) => <JobRow key={job.id} job={job} onClick={() => void inspectJob(job)} />)}</div>}
               </section>
               <div className="overview-right"><section className="surface approval-surface"><div className="section-header"><div><p className="eyebrow">TINDAKAN ANDA</p><h2>Persetujuan</h2></div><span className="approval-count">{approvals.length.toString().padStart(2, "0")}</span></div>
                   {approvals.length === 0 ? <div className="approval-empty"><span className="empty-check"><Check size={19} /></span><div><b>Semua terkendali</b><small>Tidak ada perubahan menunggu persetujuan.</small></div></div> : approvals.slice(0, 2).map((approval) => <ApprovalCard key={approval.id} approval={approval} onDecide={decide} compact />)}
@@ -482,31 +584,36 @@ export default function Home() {
 
           {section === "websites" && <>
             <div className="page-heading"><div><p className="eyebrow">KONFIGURASI</p><h1>Website</h1><p className="page-subtitle">Adapter dan status koneksi untuk setiap website terdaftar.</p></div>{user.role === "owner" && <button className="button button-dark" onClick={() => setWebsiteFormOpen((value) => !value)}><Plus size={16} /> Tambah website</button>}</div>
-            {websiteFormOpen && <form className="surface config-form" onSubmit={submitWebsite}>
-              <div className="form-title"><div><p className="eyebrow">KONFIGURASI BARU</p><h2>Daftarkan website</h2></div><button type="button" className="icon-button" aria-label="Tutup" onClick={() => setWebsiteFormOpen(false)}><X size={16} /></button></div>
-              <div className="form-grid"><label>ID unik<input name="id" placeholder="site_01" pattern="[A-Za-z0-9_-]{1,32}" required /></label><label>Nama<input name="name" placeholder="Portal utama" required /></label><label>Base URL<input name="base_url" type="url" placeholder="https://portal.milik-anda.id" required /></label><label>URL login<input name="login_url" type="url" placeholder="https://portal.milik-anda.id/login" required /></label><label>URL dashboard<input name="dashboard_url" type="url" placeholder="https://portal.milik-anda.id/dashboard" required /></label><label>Adapter ID<input name="adapter_id" defaultValue="configured_selectors" required /></label><label>Username akun<input name="username" autoComplete="off" /></label><label>Password akun<input name="password" type="password" autoComplete="new-password" /></label></div>
-              <label className="form-block">Selector & adapter config (JSON)<textarea name="adapter_config" rows={8} defaultValue={JSON.stringify({ login: { username_selector: "input[name='email']", password_selector: "input[name='password']", submit_selector: "button[type='submit']", success_indicator: "[data-testid='user-menu']", failure_indicator: ".alert-error", manual_action_indicators: [] }, extract: { fields: {} }, pages: {}, sensitive_selectors: ["input[type='password']"], forms: {} }, null, 2)} /></label>
-              <fieldset className="action-fieldset"><legend>Aksi yang diizinkan</legend>{Object.entries(actionLabels).map(([action, label]) => <label key={action} className="checkbox-row"><input type="checkbox" name="actions" value={action} defaultChecked={action === "extract_data" || action === "take_screenshot" || action === "test_login"} />{label}{action.startsWith("fill") || action.startsWith("submit") ? <span className="inline-warning">memerlukan persetujuan</span> : null}</label>)}</fieldset>
-              <div className="form-actions"><button type="button" className="button button-quiet" onClick={() => setWebsiteFormOpen(false)}>Batal</button><button className="button button-dark" type="submit">Simpan website</button></div>
+            {websiteFormOpen && <form key={editingWebsite?.id ?? "new"} className="surface config-form" onSubmit={submitWebsite}>
+              <div className="form-title"><div><p className="eyebrow">KONFIGURASI WEBSITE</p><h2>{editingWebsite ? `Edit ${editingWebsite.name}` : "Daftarkan website"}</h2></div><button type="button" className="icon-button" aria-label="Tutup" onClick={() => { setWebsiteFormOpen(false); setEditingWebsite(null); }}><X size={16} /></button></div>
+              <div className="form-grid"><label>ID unik<input name="id" defaultValue={editingWebsite?.id ?? ""} placeholder="site_01" pattern="[A-Za-z0-9_-]{1,32}" readOnly={Boolean(editingWebsite)} required /></label><label>Nama<input name="name" defaultValue={editingWebsite?.name ?? ""} placeholder="Portal utama" required /></label><label>Base URL<input name="base_url" type="url" defaultValue={editingWebsite?.base_url ?? ""} placeholder="https://portal.milik-anda.id" required /></label><label>URL login<input name="login_url" type="url" defaultValue={editingWebsite?.login_url ?? ""} placeholder="https://portal.milik-anda.id/login" required /></label><label>URL dashboard<input name="dashboard_url" type="url" defaultValue={editingWebsite?.dashboard_url ?? ""} placeholder="https://portal.milik-anda.id/dashboard" required /></label><label>Adapter ID<input name="adapter_id" defaultValue={editingWebsite?.adapter_id ?? "configured_selectors"} required /></label><label>Username akun<input name="username" autoComplete="off" placeholder={editingWebsite ? "Kosongkan untuk tetap memakai username tersimpan" : ""} /></label><label>Password akun<input name="password" type="password" autoComplete="new-password" placeholder={editingWebsite ? "Kosongkan untuk tetap memakai password tersimpan" : ""} /></label></div>
+              <label className="form-block">Selector & adapter config (JSON)<textarea name="adapter_config" rows={8} defaultValue={JSON.stringify(editingWebsite?.adapter_config ?? defaultAdapterConfig, null, 2)} /></label>
+              <fieldset className="action-fieldset"><legend>Aksi yang diizinkan</legend>{Object.entries(actionLabels).map(([action, label]) => <label key={action} className="checkbox-row"><input type="checkbox" name="actions" value={action} defaultChecked={editingWebsite ? editingWebsite.allowed_actions.includes(action) : action === "extract_data" || action === "take_screenshot" || action === "test_login"} />{label}{action.startsWith("fill") || action.startsWith("submit") ? <span className="inline-warning">memerlukan persetujuan</span> : null}</label>)}</fieldset>
+              <div className="form-actions"><button type="button" className="button button-quiet" onClick={() => { setWebsiteFormOpen(false); setEditingWebsite(null); }}>Batal</button><button className="button button-dark" type="submit">{editingWebsite ? "Simpan perubahan" : "Simpan website"}</button></div>
             </form>}
-            <section className="surface full-table"><div className="table-toolbar"><div className="search-box"><Search size={16} /><input placeholder="Cari website..." value={search} onChange={(event) => setSearch(event.target.value)} /></div><button className="icon-button" title="Filter"><SlidersHorizontal size={16} /></button></div>{websites.length === 0 ? <EmptyState title="Belum ada website" detail="Website yang Anda daftarkan akan tercatat di sini." /> : <div className="table-wrap"><table><thead><tr><th>NAMA WEBSITE</th><th>ADAPTER</th><th>AKSI DIIZINKAN</th><th>STATUS</th><th>UJI / STATUS</th></tr></thead><tbody>{websites.filter((site) => `${site.name} ${site.id}`.toLowerCase().includes(search.toLowerCase())).map((site) => <tr key={site.id}><td><div className="site-cell"><span className="site-avatar">{site.name.slice(0, 1).toUpperCase()}</span><span><b>{site.name}</b><small>{site.base_url}</small></span></div></td><td><code>{site.adapter_id}</code></td><td>{site.allowed_actions.map((action) => <span key={action} className="action-chip">{actionLabels[action] ?? action}</span>)}</td><td><Badge value={site.status} /></td><td className="table-actions">{user.role !== "viewer" && <button className="button button-quiet button-small" onClick={() => void runLoginTest(site)}>Uji login</button>}{user.role === "owner" && <button className="button button-quiet button-small" onClick={() => void toggleWebsite(site)}>{site.status === "active" ? "Nonaktifkan" : "Aktifkan"}</button>}</td></tr>)}</tbody></table></div>}</section>
+            <section className="surface full-table"><div className="table-toolbar"><div className="search-box"><Search size={16} /><input placeholder="Cari website..." value={search} onChange={(event) => setSearch(event.target.value)} /></div><button className="icon-button" title="Filter"><SlidersHorizontal size={16} /></button></div>{websites.length === 0 ? <EmptyState title="Belum ada website" detail="Website yang Anda daftarkan akan tercatat di sini." /> : <div className="table-wrap"><table><thead><tr><th>NAMA WEBSITE</th><th>ADAPTER</th><th>AKSI DIIZINKAN</th><th>STATUS</th><th>UJI / STATUS</th></tr></thead><tbody>{websites.filter((site) => `${site.name} ${site.id}`.toLowerCase().includes(search.toLowerCase())).map((site) => <tr key={site.id}><td><div className="site-cell"><span className="site-avatar">{site.name.slice(0, 1).toUpperCase()}</span><span><b>{site.name}</b><small>{site.base_url}</small></span></div></td><td><code>{site.adapter_id}</code></td><td>{site.allowed_actions.map((action) => <span key={action} className="action-chip">{actionLabels[action] ?? action}</span>)}</td><td><Badge value={site.status} /></td><td className="table-actions">{user.role === "owner" && <button className="button button-quiet button-small" onClick={() => editWebsite(site)}><Pencil size={12} /> Edit</button>}{user.role !== "viewer" && <button className="button button-quiet button-small" onClick={() => void runLoginTest(site)}>Uji login</button>}{user.role === "owner" && <button className="button button-quiet button-small" onClick={() => void toggleWebsite(site)}>{site.status === "active" ? "Nonaktifkan" : "Aktifkan"}</button>}</td></tr>)}</tbody></table></div>}</section>
           </>}
 
           {section === "jobs" && <>
             <div className="page-heading"><div><p className="eyebrow">JEJAK EKSEKUSI</p><h1>Riwayat job</h1><p className="page-subtitle">Setiap permintaan, hasil, dan kegagalan tercatat.</p></div>{user.role !== "viewer" ? <button className="button button-dark" onClick={() => setJobFormOpen((value) => !value)}><Plus size={16} /> Jalankan aksi baca</button> : <span className="read-only-label"><ShieldCheck size={15} /> Tercatat untuk audit</span>}</div>
             {jobFormOpen && <form className="surface config-form" onSubmit={submitJob}><div className="form-title"><div><p className="eyebrow">JOB MANUAL</p><h2>Aksi baca</h2></div><button type="button" className="icon-button" aria-label="Tutup" onClick={() => setJobFormOpen(false)}><X size={16} /></button></div><div className="form-grid"><label>Website<select name="website_id" required>{websites.filter((site) => site.status === "active").map((site) => <option key={site.id} value={site.id}>{site.name} · {site.id}</option>)}</select></label><label>Aksi<select name="action"><option value="extract_data">Ekstraksi data</option><option value="take_screenshot">Screenshot</option><option value="test_login">Uji login</option></select></label></div><label className="form-block">Parameter JSON<textarea name="payload" rows={3} defaultValue="{}" /></label><div className="form-actions"><button type="button" className="button button-quiet" onClick={() => setJobFormOpen(false)}>Batal</button><button className="button button-dark" type="submit" disabled={!websites.some((site) => site.status === "active")}>Masukkan antrean</button></div></form>}
-            <section className="surface full-table"><div className="table-toolbar"><div className="search-box"><Search size={16} /><input placeholder="Cari aksi atau website..." value={search} onChange={(event) => setSearch(event.target.value)} /></div><span className="result-count">{filteredJobs.length} aktivitas</span></div>{filteredJobs.length === 0 ? <EmptyState title="Tidak ada job yang cocok" detail="Ubah pencarian atau jalankan aksi baca." /> : <div className="table-wrap"><table><thead><tr><th>AKSI</th><th>WEBSITE</th><th>RISIKO</th><th>STATUS</th><th>WAKTU</th><th></th></tr></thead><tbody>{filteredJobs.map((job) => <tr key={job.id}><td><b>{actionLabels[job.action] ?? job.action}</b><small className="job-id">{job.id}</small></td><td><code>{job.website_id}</code></td><td><span className={`risk-label risk-${job.risk_level}`}>{job.risk_level === "read" ? <ArrowDownRight size={13} /> : <ArrowUpRight size={13} />}{job.risk_level}</span></td><td><Badge value={job.status} /></td><td>{formatTime(job.created_at)}</td><td className="table-actions">{job.last_error_code && <span title={job.last_error_message ?? ""}><CircleAlert size={15} className="error-icon" /></span>}{user.role !== "viewer" && ["queued", "running", "executing", "awaiting_approval"].includes(job.status) && <button className="button button-quiet button-small" onClick={() => void cancelJob(job)}>Batalkan</button>}</td></tr>)}</tbody></table></div>}</section>
+            <section className="surface full-table">
+              <div className="table-toolbar"><div className="search-box"><Search size={16} /><input placeholder="Cari aksi atau website..." value={search} onChange={(event) => setSearch(event.target.value)} /></div><span className="result-count">{filteredJobs.length} aktivitas</span></div>
+              {filteredJobs.length === 0 ? <EmptyState title="Tidak ada job yang cocok" detail="Ubah pencarian atau jalankan aksi baca." /> : <div className="table-wrap"><table><thead><tr><th>AKSI</th><th>WEBSITE</th><th>RISIKO</th><th>STATUS</th><th>WAKTU</th><th></th></tr></thead><tbody>{filteredJobs.map((job) => <tr key={job.id}><td><b>{actionLabels[job.action] ?? job.action}</b><small className="job-id">{job.id}</small></td><td><code>{job.website_id}</code></td><td><span className={`risk-label risk-${job.risk_level}`}>{job.risk_level === "read" ? <ArrowDownRight size={13} /> : <ArrowUpRight size={13} />}{job.risk_level}</span></td><td><Badge value={job.status} /></td><td>{formatTime(job.created_at)}</td><td className="table-actions"><button className="button button-quiet button-small" onClick={() => void inspectJob(job)} disabled={jobDetailBusy}>Detail</button>{job.last_error_code && <span title={job.last_error_message ?? ""}><CircleAlert size={15} className="error-icon" /></span>}{user.role !== "viewer" && ["queued", "running", "executing", "awaiting_approval"].includes(job.status) && <button className="button button-quiet button-small" onClick={() => void cancelJob(job)}>Batalkan</button>}</td></tr>)}</tbody></table></div>}
+            </section>
           </>}
 
           {section === "approvals" && <><div className="page-heading"><div><p className="eyebrow">HUMAN-IN-THE-LOOP</p><h1>Persetujuan</h1><p className="page-subtitle">Tinjau perubahan sebelum worker mengeksekusinya.</p></div><div className="pending-pill"><span className="pending-dot" />{approvals.length} menunggu</div></div>{approvals.length === 0 ? <section className="surface approval-blank"><span className="empty-check"><Check size={22} /></span><h2>Tidak ada perubahan tertunda</h2><p>Pratinjau perubahan akan muncul di sini sebelum dieksekusi.</p></section> : <div className="approval-page-list">{approvals.map((approval) => <ApprovalCard key={approval.id} approval={approval} onDecide={decide} />)}</div>}</>}
 
           {section === "schedules" && <>
             <div className="page-heading"><div><p className="eyebrow">OTOMASI BERJADWAL</p><h1>Jadwal</h1><p className="page-subtitle">Eksekusi berulang hanya untuk tindakan baca.</p></div><span className="read-only-label"><ShieldCheck size={15} /> Write diblokir</span></div>
-            {user.role === "owner" && <form className="surface config-form" onSubmit={submitSchedule}><div className="form-title"><div><p className="eyebrow">JADWAL BARU</p><h2>Buat jadwal</h2></div><CalendarClock size={17} /></div><div className="form-grid"><label>Nama jadwal<input name="name" placeholder="Ekstraksi harian" required /></label><label>Website<select name="website_id" required>{websites.filter((site) => site.status === "active").map((site) => <option key={site.id} value={site.id}>{site.name} · {site.id}</option>)}</select></label><label>Aksi baca<select name="action"><option value="extract_data">Ekstraksi data</option><option value="take_screenshot">Screenshot</option><option value="test_login">Uji login</option></select></label><label>Ekspresi cron<input name="cron_expr" defaultValue="0 8 * * *" required /></label><label>Zona waktu IANA<input name="timezone" defaultValue="Asia/Jakarta" required /></label><label>Parameter (JSON)<input name="payload" defaultValue="{}" /></label></div><div className="form-actions"><button className="button button-dark" type="submit"><Plus size={15} /> Simpan jadwal</button></div></form>}
-            <section className="surface full-table"><div className="table-toolbar"><b className="toolbar-title">Jadwal terdaftar</b><span className="result-count">{schedules.length} jadwal</span></div>{schedules.length === 0 ? <EmptyState title="Belum ada jadwal" detail="Buat jadwal untuk aksi baca yang perlu dijalankan berulang." /> : <div className="table-wrap"><table><thead><tr><th>NAMA</th><th>WEBSITE</th><th>AKSI</th><th>CRON / ZONA WAKTU</th><th>EKSEKUSI BERIKUTNYA</th><th>STATUS</th><th></th></tr></thead><tbody>{schedules.map((schedule) => <tr key={schedule.id}><td><b>{schedule.name}</b></td><td><code>{schedule.website_id}</code></td><td>{actionLabels[schedule.action] ?? schedule.action}</td><td><code>{schedule.cron_expr}</code><small>{schedule.timezone}</small></td><td>{formatTime(schedule.next_run_at)}</td><td><Badge value={schedule.is_active ? "active" : "disabled"} /></td><td>{user.role === "owner" && schedule.is_active && <button className="button button-quiet button-small" onClick={async () => { try { await api(`/schedules/${schedule.id}`, { method: "DELETE" }); setSchedules(await api<Schedule[]>("/schedules")); } catch (error) { setNotice(error instanceof Error ? error.message : "Jadwal gagal dinonaktifkan."); } }}>Nonaktifkan</button>}</td></tr>)}</tbody></table></div>}</section>
+            {user.role === "owner" && <form key={editingSchedule?.id ?? "new"} className="surface config-form" onSubmit={submitSchedule}><div className="form-title"><div><p className="eyebrow">{editingSchedule ? "JADWAL TERSIMPAN" : "JADWAL BARU"}</p><h2>{editingSchedule ? `Edit ${editingSchedule.name}` : "Buat jadwal"}</h2></div><CalendarClock size={17} /></div><div className="form-grid"><label>Nama jadwal<input name="name" defaultValue={editingSchedule?.name ?? ""} placeholder="Ekstraksi harian" required /></label><label>Website<select name="website_id" required defaultValue={editingSchedule?.website_id ?? websites.find((site) => site.status === "active")?.id ?? ""}>{websites.filter((site) => site.status === "active").map((site) => <option key={site.id} value={site.id}>{site.name} · {site.id}</option>)}</select></label><label>Aksi baca<select name="action" defaultValue={editingSchedule?.action ?? "extract_data"}><option value="extract_data">Ekstraksi data</option><option value="take_screenshot">Screenshot</option><option value="test_login">Uji login</option></select></label><label>Ekspresi cron<input name="cron_expr" defaultValue={editingSchedule?.cron_expr ?? "0 8 * * *"} required /></label><label>Zona waktu IANA<input name="timezone" defaultValue={editingSchedule?.timezone ?? "Asia/Jakarta"} required /></label><label>Parameter (JSON)<textarea name="payload" rows={3} defaultValue={JSON.stringify(editingSchedule?.payload ?? {}, null, 2)} /></label></div><div className="form-actions">{editingSchedule && <button type="button" className="button button-quiet" onClick={() => setEditingSchedule(null)}>Batal edit</button>}<button className="button button-dark" type="submit"><Plus size={15} />{editingSchedule ? "Simpan perubahan" : "Simpan jadwal"}</button></div></form>}
+            <section className="surface full-table"><div className="table-toolbar"><b className="toolbar-title">Jadwal terdaftar</b><span className="result-count">{schedules.length} jadwal</span></div>{schedules.length === 0 ? <EmptyState title="Belum ada jadwal" detail="Buat jadwal untuk aksi baca yang perlu dijalankan berulang." /> : <div className="table-wrap"><table><thead><tr><th>NAMA</th><th>WEBSITE</th><th>AKSI</th><th>CRON / ZONA WAKTU</th><th>EKSEKUSI BERIKUTNYA</th><th>STATUS</th><th></th></tr></thead><tbody>{schedules.map((schedule) => <tr key={schedule.id}><td><b>{schedule.name}</b></td><td><code>{schedule.website_id}</code></td><td>{actionLabels[schedule.action] ?? schedule.action}</td><td><code>{schedule.cron_expr}</code><small>{schedule.timezone}</small></td><td>{formatTime(schedule.next_run_at)}</td><td><Badge value={schedule.is_active ? "active" : "disabled"} /></td><td className="table-actions">{user.role === "owner" && <><button className="button button-quiet button-small" onClick={() => editSchedule(schedule)}><Pencil size={12} /> Edit</button>{schedule.is_active && <button className="button button-quiet button-small" onClick={async () => { try { await api(`/schedules/${schedule.id}`, { method: "DELETE" }); setSchedules(await api<Schedule[]>("/schedules")); if (editingSchedule?.id === schedule.id) setEditingSchedule(null); } catch (error) { setNotice(error instanceof Error ? error.message : "Jadwal gagal dinonaktifkan."); } }}>Nonaktifkan</button>}</>}</td></tr>)}</tbody></table></div>}</section>
           </>}
 
           {section === "ai" && <><div className="page-heading"><div><p className="eyebrow">GATEWAY MODEL</p><h1>Pengaturan AI</h1><p className="page-subtitle">Gemini mengusulkan tindakan; backend tetap menegakkan kebijakan.</p></div><Badge value={aiSettings?.status ?? "unverified"} /></div>{!aiSettings ? <section className="surface"><EmptyState title="Memuat konfigurasi" detail="Menghubungkan ke AI Gateway." /></section> : <form id="ai-settings" name="ai-settings" className="surface config-form" onSubmit={submitAISettings}><div className="form-title"><div><p className="eyebrow">GOOGLE GEMINI</p><h2>Koneksi dan kebijakan</h2></div><Bot size={18} /></div><label className="form-block">API key{aiSettings.api_key_masked && <small className="field-note">Key tersimpan: {aiSettings.api_key_masked}. Nilai asli tidak dapat dibaca kembali.</small>}<input name="api_key" type="password" autoComplete="new-password" placeholder={aiSettings.configured ? "Kosongkan untuk tetap memakai key tersimpan" : "AIza..."} /></label><div className="form-actions form-actions-left"><button type="button" className="button button-quiet" disabled={aiDiscoverBusy} onClick={() => void discoverAIModels()}><RefreshCw size={14} />{aiDiscoverBusy ? "Memuat model..." : "Muat model dari Gemini"}</button><span className="field-note">Daftar model tidak disimpan permanen.</span></div><div className="form-grid"><label>Model utama<select name="primary_model_id" required defaultValue={aiSettings.primary_model_id ?? ""} disabled={aiModels.length === 0}><option value="" disabled>{aiModels.length ? "Pilih model" : "Muat model terlebih dahulu"}</option>{aiModels.map((model) => <option key={model.id} value={model.id}>{model.display_name}</option>)}</select></label><label>Model cadangan<select name="fallback_model_id" defaultValue={aiSettings.fallback_model_id ?? ""} disabled={aiModels.length === 0}><option value="">Tidak digunakan</option>{aiModels.map((model) => <option key={model.id} value={model.id}>{model.display_name}</option>)}</select></label><label>Temperature<input name="temperature" type="number" min="0" max="1" step="0.05" defaultValue={aiSettings.temperature} /></label><label>Token maksimum<input name="max_output_tokens" type="number" min="128" max="8192" step="128" defaultValue={aiSettings.max_output_tokens} /></label><label>Timeout (detik)<input name="timeout_seconds" type="number" min="5" max="120" defaultValue={aiSettings.timeout_seconds} /></label><label>Mode<select name="mode" defaultValue={aiSettings.mode}><option value="structured_only">Perintah terstruktur</option><option value="hybrid">Hybrid</option></select></label></div><label className="form-block">Instruksi sistem<textarea name="system_instruction" rows={4} maxLength={4000} defaultValue={aiSettings.system_instruction} /></label><label className="toggle-row"><input name="allow_ai_write_proposals" type="checkbox" defaultChecked={aiSettings.allow_ai_write_proposals} /><span><b>Izinkan usulan tindakan tulis dari AI</b><small>Approval tetap wajib untuk semua tindakan tulis.</small></span></label><div className="form-actions"><button type="button" className="button button-quiet" disabled={!aiSettings.configured} onClick={() => void testAI()}><Activity size={14} /> Uji koneksi</button><button className="button button-dark" type="submit" disabled={!aiModels.length}>Simpan pengaturan</button></div></form>}</>}
+
+          {section === "security" && <><div className="page-heading"><div><p className="eyebrow">KEAMANAN AKUN</p><h1>Autentikasi dua faktor</h1><p className="page-subtitle">Tambahkan TOTP untuk melindungi login owner.</p></div><Badge value={user.totp_enabled ? "active" : "disabled"} /></div><section className="surface config-form security-panel"><div className="form-title"><div><p className="eyebrow">TOTP</p><h2>{user.totp_enabled ? "Proteksi aktif" : "Proteksi belum aktif"}</h2></div><ShieldCheck size={18} /></div>{user.totp_enabled ? <form onSubmit={disableTotpSetup} className="security-form"><p className="field-note">Menonaktifkan TOTP membutuhkan password dan kode autentikasi terbaru.</p><div className="form-grid"><label>Password akun<input name="password" type="password" autoComplete="current-password" required /></label><label>Kode authenticator<input name="code" inputMode="numeric" autoComplete="one-time-code" pattern="[0-9]{6}" maxLength={6} required /></label></div><div className="form-actions"><button className="button button-quiet" type="submit">Nonaktifkan TOTP</button></div></form> : totpSecret ? <form onSubmit={confirmTotpSetup} className="security-form"><div className="totp-secret"><span>Secret setup</span><code>{totpSecret}</code><small>Masukkan secret ini ke aplikasi authenticator. Secret hanya ditampilkan pada tahap setup.</small></div><label className="form-block">URI authenticator<code className="totp-uri">{totpUri}</code></label><div className="form-grid"><label>Kode 6 digit<input name="code" inputMode="numeric" autoComplete="one-time-code" pattern="[0-9]{6}" maxLength={6} required /></label></div><div className="form-actions"><button className="button button-quiet" type="button" onClick={() => { setTotpSecret(null); setTotpUri(""); }}>Batalkan setup</button><button className="button button-dark" type="submit">Konfirmasi TOTP</button></div></form> : <div className="security-start"><p className="field-note">Setelah diaktifkan, login owner memerlukan kode authenticator enam digit.</p><button className="button button-dark" onClick={() => void beginTotpSetup()}><ShieldCheck size={15} /> Siapkan TOTP</button></div>}</section></>}
 
           {section === "audit" && <><div className="page-heading"><div><p className="eyebrow">APPEND-ONLY</p><h1>Audit log</h1><p className="page-subtitle">Jejak tindakan pengguna, AI, job, dan konfigurasi.</p></div><span className="read-only-label"><ShieldCheck size={15} /> Owner only</span></div><section className="surface full-table"><div className="table-toolbar"><b className="toolbar-title">Peristiwa terbaru</b><span className="result-count">{auditLogs.length} peristiwa</span></div>{auditLogs.length === 0 ? <EmptyState title="Belum ada catatan audit" detail="Aktivitas sistem akan tercatat di sini." /> : <div className="table-wrap"><table><thead><tr><th>WAKTU</th><th>PELAKU</th><th>PERISTIWA</th><th>OBJEK</th><th>HASIL</th></tr></thead><tbody>{auditLogs.map((item, index) => <tr key={String(item.id ?? index)}><td>{formatTime(String(item.occurred_at))}</td><td><code>{String(item.actor_type)} · {String(item.actor_id).slice(0, 12)}</code></td><td><b>{String(item.action)}</b></td><td>{String(item.target_type)} · {String(item.target_id).slice(0, 14)}</td><td><Badge value={String(item.result)} /></td></tr>)}</tbody></table></div>}</section></>}
 
@@ -523,8 +630,8 @@ function Metric({ label, value, note, icon, trend, attention }: { label: string;
   return <article className={`metric-card ${attention ? "metric-attention" : ""}`}><div className="metric-top"><span className="metric-icon">{icon}</span>{trend && <span className={`metric-trend ${trend === "live" ? "trend-live" : ""}`}>{trend === "live" && <span className="pulse-dot" />}{trend === "stabil" ? "STABIL" : trend === "terkini" ? "30 TERAKHIR" : "LIVE"}</span>}</div><div className="metric-value">{value}</div><div className="metric-label">{label}</div><div className="metric-note">{note}</div></article>;
 }
 
-function JobRow({ job }: { job: Job }) {
-  return <div className="activity-row"><span className={`activity-icon activity-${job.status}`}>{job.status === "succeeded" ? <Check size={15} /> : job.status === "failed" ? <X size={15} /> : <Activity size={15} />}</span><span className="activity-main"><b>{actionLabels[job.action] ?? job.action}<span className="activity-on"> pada </span><span className="activity-site">{job.website_id}</span></b><small>{formatTime(job.created_at)}</small></span><Badge value={job.status} /></div>;
+function JobRow({ job, onClick }: { job: Job; onClick: () => void }) {
+  return <button className="activity-row activity-button" onClick={onClick}><span className={`activity-icon activity-${job.status}`}>{job.status === "succeeded" ? <Check size={15} /> : job.status === "failed" ? <X size={15} /> : <Activity size={15} />}</span><span className="activity-main"><b>{actionLabels[job.action] ?? job.action}<span className="activity-on"> pada </span><span className="activity-site">{job.website_id}</span></b><small>{formatTime(job.created_at)}</small></span><Badge value={job.status} /><span className="activity-detail">Detail</span></button>;
 }
 
 function ApprovalCard({ approval, onDecide, compact = false }: { approval: Approval; onDecide: (approval: Approval, decision: "approve" | "reject") => void; compact?: boolean }) {

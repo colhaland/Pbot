@@ -22,12 +22,25 @@ def next_run(schedule: Schedule, now: datetime) -> datetime:
     return croniter(schedule.cron_expr, local_now).get_next(datetime).astimezone(timezone.utc)
 
 
+def should_run_due(schedule: Schedule, now: datetime) -> bool:
+    if schedule.misfire_policy != "skip":
+        return True
+    zone = ZoneInfo(schedule.timezone)
+    local_now = now.astimezone(zone)
+    latest_due = croniter(schedule.cron_expr, local_now).get_prev(datetime)
+    scheduled_for = schedule.next_run_at.astimezone(zone)
+    return scheduled_for >= latest_due
+
+
 async def run_due_schedules() -> int:
     created = 0
     now = utcnow()
     async with SessionLocal() as db:
         result = await db.execute(select(Schedule).where(Schedule.is_active.is_(True), Schedule.next_run_at <= now).order_by(Schedule.next_run_at).with_for_update(skip_locked=True).limit(100))
         for schedule in result.scalars().all():
+            if not should_run_due(schedule, now):
+                schedule.next_run_at = next_run(schedule, now)
+                continue
             website = await db.get(Website, schedule.website_id)
             if website and website.status == WebsiteStatus.active:
                 try:

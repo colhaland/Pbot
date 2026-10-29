@@ -157,6 +157,10 @@ class TOTPInput(BaseModel):
     code: str = Field(pattern=r"^\d{6}$")
 
 
+class TOTPDisableInput(TOTPInput):
+    password: str = Field(min_length=1, max_length=1024)
+
+
 class AIInterpretInput(BaseModel):
     instruction: str = Field(min_length=3, max_length=2000)
     idempotency_key: str | None = Field(default=None, max_length=128)
@@ -463,7 +467,7 @@ async def login(data: LoginInput, response: Response, request: Request, db: Asyn
     )
     if requires_totp:
         return {"requires_totp": True}
-    return {"user": {"id": str(user.id), "email": user.email, "role": user.role.value}, "csrf_token": csrf_token}
+    return {"user": {"id": str(user.id), "email": user.email, "role": user.role.value, "totp_enabled": user.totp_enabled}, "csrf_token": csrf_token}
 
 
 @app.post("/api/v1/auth/totp/verify")
@@ -489,7 +493,7 @@ async def verify_login_totp(data: TOTPInput, request: Request, response: Respons
     _audit(db, actor_type="user", actor_id=str(user.id), action="auth.totp.verified", target_type="user", target_id=str(user.id))
     await db.commit()
     response.set_cookie(settings.session_cookie_name, raw_token, httponly=True, secure=settings.session_cookie_secure, samesite="strict", max_age=settings.session_absolute_hours * 3600, path="/")
-    return {"user": {"id": str(user.id), "email": user.email, "role": user.role.value}, "csrf_token": csrf_token}
+    return {"user": {"id": str(user.id), "email": user.email, "role": user.role.value, "totp_enabled": user.totp_enabled}, "csrf_token": csrf_token}
 
 
 @app.post("/api/v1/auth/totp/setup")
@@ -525,6 +529,31 @@ async def confirm_totp(
     return {"enabled": True}
 
 
+@app.post("/api/v1/auth/totp/disable")
+async def disable_totp(
+    data: TOTPDisableInput,
+    user: User = Depends(require_csrf),
+    _: User = Depends(require_role(Role.owner)),
+    db: AsyncSession = Depends(get_db),
+):
+    if not user.totp_enabled or not user.totp_secret_enc:
+        raise error(409, "TOTP_NOT_ENABLED", "Autentikasi dua faktor belum aktif.")
+    try:
+        password_valid = password_hasher.verify(user.password_hash, data.password)
+    except Exception:
+        password_valid = False
+    if not password_valid:
+        raise error(401, "PASSWORD_INVALID", "Password tidak sesuai.")
+    secret = decrypt_secret(user.totp_secret_enc, table="users.totp_secret", record_id=str(user.id))
+    if not pyotp.TOTP(secret).verify(data.code, valid_window=1):
+        raise error(401, "TOTP_INVALID", "Kode autentikasi tidak valid.")
+    user.totp_enabled = False
+    user.totp_secret_enc = None
+    _audit(db, actor_type="user", actor_id=str(user.id), action="auth.totp.disabled", target_type="user", target_id=str(user.id))
+    await db.commit()
+    return {"enabled": False}
+
+
 @app.post("/api/v1/auth/logout", status_code=204)
 async def logout(
     request: Request,
@@ -544,7 +573,7 @@ async def logout(
 
 @app.get("/api/v1/auth/me")
 async def current_user(user: User = Depends(get_current_user)):
-    return {"id": str(user.id), "email": user.email, "role": user.role.value}
+    return {"id": str(user.id), "email": user.email, "role": user.role.value, "totp_enabled": user.totp_enabled}
 
 
 @app.get("/api/v1/websites")
@@ -766,6 +795,28 @@ async def get_job(job_id: uuid.UUID, _: User = Depends(require_role(Role.viewer)
     if not job:
         raise error(404, "JOB_NOT_FOUND", "Job tidak ditemukan.")
     return job_response(job)
+
+
+@app.get("/api/v1/jobs/{job_id}/artifacts")
+async def list_job_artifacts(
+    job_id: uuid.UUID,
+    _: User = Depends(require_role(Role.viewer)),
+    db: AsyncSession = Depends(get_db),
+):
+    if not await db.get(Job, job_id):
+        raise error(404, "JOB_NOT_FOUND", "Job tidak ditemukan.")
+    result = await db.execute(select(Artifact).where(Artifact.job_id == job_id).order_by(Artifact.created_at))
+    return [
+        {
+            "id": str(artifact.id),
+            "kind": artifact.kind,
+            "checksum_sha256": artifact.checksum_sha256,
+            "size_bytes": artifact.size_bytes,
+            "expires_at": artifact.expires_at.isoformat(),
+            "created_at": artifact.created_at.isoformat(),
+        }
+        for artifact in result.scalars().all()
+    ]
 
 
 @app.post("/api/v1/jobs/{job_id}/cancel")

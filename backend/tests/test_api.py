@@ -210,3 +210,40 @@ async def test_replayed_telegram_update_returns_existing_job(client):
         await db.commit()
         jobs = (await db.execute(select(Job).where(Job.idempotency_key == "telegram:710001"))).scalars().all()
         assert len(jobs) == 1
+
+
+@pytest.mark.asyncio
+async def test_owner_totp_setup_login_challenge_and_disable(client, monkeypatch):
+    import pyotp
+
+    from app import crypto
+
+    http, _ = client
+    await login(http)
+    monkeypatch.setattr(
+        crypto,
+        "get_settings",
+        lambda: Settings(encryption_master_key=SecretStr("c7" * 32)),
+    )
+
+    setup = await http.post("/api/v1/auth/totp/setup", json={})
+    assert setup.status_code == 200
+    secret = setup.json()["secret"]
+    confirmed = await http.post("/api/v1/auth/totp/confirm", json={"code": pyotp.TOTP(secret).now()})
+    assert confirmed.status_code == 200
+    assert (await http.get("/api/v1/auth/me")).json()["totp_enabled"] is True
+
+    logged_in = await http.post("/api/v1/auth/login", json={"email": "owner@example.test", "password": "a-secure-test-password"})
+    assert logged_in.status_code == 200
+    assert logged_in.json() == {"requires_totp": True}
+    verification = await http.post("/api/v1/auth/totp/verify", json={"code": pyotp.TOTP(secret).now()})
+    assert verification.status_code == 200
+    http.headers["X-CSRF-Token"] = verification.json()["csrf_token"]
+
+    disabled = await http.post(
+        "/api/v1/auth/totp/disable",
+        json={"password": "a-secure-test-password", "code": pyotp.TOTP(secret).now()},
+    )
+    assert disabled.status_code == 200
+    assert disabled.json()["enabled"] is False
+    assert (await http.get("/api/v1/auth/me")).json()["totp_enabled"] is False

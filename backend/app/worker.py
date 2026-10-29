@@ -78,6 +78,15 @@ async def execute_job(job_id) -> None:
             await db.commit()
             await redis.aclose()
             return
+        if website.adapter_id != adapter.adapter_id:
+            website.status = WebsiteStatus.needs_attention
+            job.status = JobStatus.failed
+            job.last_error_code = "ADAPTER_NOT_FOUND"
+            job.last_error_message = "Adapter website belum terdaftar pada worker."
+            job.finished_at = utcnow()
+            await db.commit()
+            await redis.aclose()
+            return
         lock = redis.lock(f"website:{website.id}", timeout=settings.job_default_timeout_seconds + 60, blocking_timeout=1)
         try:
             if not await lock.acquire():

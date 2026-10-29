@@ -239,6 +239,33 @@ td code { color: #5c6e63; font-family: var(--mono); font-size: 9px; }
 .approval-blank { min-height: 280px; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; }
 .approval-blank h2 { margin: 15px 0 5px; font-family: Georgia, "Times New Roman", serif; font-size: 21px; font-weight: 400; }
 .approval-blank p { margin: 0; color: #8e9892; font-size: 11px; }
+.activity-button { width: 100%; border-right: 0; border-bottom: 0; border-left: 0; background: white; padding: 0; text-align: left; }
+.activity-button:hover { background: #fbfcfa; }
+.activity-detail { color: #849087; font-size: 9px; opacity: 0; }
+.activity-button:hover .activity-detail, .activity-button:focus-visible .activity-detail { opacity: 1; }
+.modal-backdrop { position: fixed; z-index: 50; inset: 0; display: grid; place-items: center; padding: 20px; background: #17231fcc; }
+.job-detail-modal { width: min(660px, 100%); max-height: min(85vh, 760px); overflow: auto; padding: 18px; box-shadow: 0 18px 70px #14231e30; animation: enter .2s ease both; }
+.job-detail-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px; margin-top: 13px; color: #7b8780; font-size: 10px; }
+.job-detail-meta code { color: #52665a; font-family: var(--mono); font-size: 9px; }
+.job-detail-meta b { color: #46534b; font-weight: 600; }
+.job-error-panel { display: flex; align-items: flex-start; gap: 9px; margin-top: 15px; border: 1px solid #f0d7d0; border-radius: 4px; padding: 10px; background: #fff7f5; color: #a64e43; }
+.job-error-panel > span { display: grid; gap: 4px; }
+.job-error-panel b { font-size: 10px; }
+.job-error-panel small { color: #8e6961; font-size: 10px; }
+.artifact-heading { margin: 20px 0 9px; color: #4b5850; font-size: 11px; }
+.artifact-list { display: grid; gap: 8px; }
+.artifact-item { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 9px; border: 1px solid #edf0ec; border-radius: 4px; padding: 10px; }
+.artifact-item > div:first-child { display: grid; gap: 4px; min-width: 0; }
+.artifact-item b { color: #46534b; font-size: 10px; }
+.artifact-item small { color: #8a958e; font-size: 9px; overflow-wrap: anywhere; }
+.artifact-preview { grid-column: 1 / -1; width: 100%; max-height: 420px; object-fit: contain; border: 1px solid #e8ece8; background: #f7f8f6; }
+.security-panel { max-width: 720px; }
+.security-form, .security-start { display: grid; gap: 15px; }
+.totp-secret { display: grid; gap: 7px; border: 1px solid #e3e9e3; border-radius: 4px; padding: 13px; background: #f8faf7; }
+.totp-secret > span { color: #64736a; font-size: 10px; font-weight: 650; }
+.totp-secret code { overflow-wrap: anywhere; color: #1d6b50; font-family: var(--mono); font-size: 15px; }
+.totp-secret small { color: #849087; font-size: 10px; line-height: 1.5; }
+.totp-uri { display: block; overflow-wrap: anywhere; border: 1px solid #e4e9e4; border-radius: 4px; padding: 9px; color: #738078; font-family: var(--mono); font-size: 9px; font-weight: 400; }
 .config-form { display: grid; gap: 16px; margin-bottom: 14px; padding: 18px; }
 .form-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: #527561; }
 .form-title .eyebrow { margin-bottom: 5px; }
