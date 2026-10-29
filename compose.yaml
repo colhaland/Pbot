@@ -1,0 +1,107 @@
+services:
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.api
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgresql+asyncpg://pbot:${POSTGRES_PASSWORD:-local-development-only}@host.docker.internal:5432/pbot
+      REDIS_URL: redis://host.docker.internal:6379/0
+      ENCRYPTION_MASTER_KEY: ${ENCRYPTION_MASTER_KEY:-}
+      SESSION_SECRET: ${SESSION_SECRET:-local-only-change-before-deploy}
+      SESSION_COOKIE_SECURE: "false"
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_WEBHOOK_SECRET: ${TELEGRAM_WEBHOOK_SECRET:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.worker
+    command: ["python", "-m", "app.worker"]
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgresql+asyncpg://pbot:${POSTGRES_PASSWORD:-local-development-only}@host.docker.internal:5432/pbot
+      REDIS_URL: redis://host.docker.internal:6379/0
+      ENCRYPTION_MASTER_KEY: ${ENCRYPTION_MASTER_KEY:-}
+      ENCRYPTION_KEY_VERSION: ${ENCRYPTION_KEY_VERSION:-1}
+      ARTIFACT_DIR: /data/artifacts
+      BROWSER_MAX_CONCURRENCY: ${BROWSER_MAX_CONCURRENCY:-3}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - artifacts:/data/artifacts
+    depends_on:
+      api:
+        condition: service_started
+    restart: unless-stopped
+
+  scheduler:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.api
+    command: ["python", "-m", "app.scheduler"]
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgresql+asyncpg://pbot:${POSTGRES_PASSWORD:-local-development-only}@host.docker.internal:5432/pbot
+      REDIS_URL: redis://host.docker.internal:6379/0
+    depends_on:
+      api:
+        condition: service_started
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        API_INTERNAL_URL: http://host.docker.internal:8000
+    environment:
+      API_INTERNAL_URL: http://host.docker.internal:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: pbot
+      POSTGRES_USER: pbot
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local-development-only}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pbot -d pbot"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  postgres_data:
+  artifacts:
