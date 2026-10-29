@@ -6,18 +6,18 @@ Platform otomasi multi-website dengan dashboard, Telegram, Gemini, worker Playwr
 
 Prasyarat: Docker Compose, Python 3.12+, Node.js 20+.
 
-1. Salin `.env.example` ke `.env`. Isi `ENCRYPTION_MASTER_KEY` dengan 32 byte hex (`openssl rand -hex 32`) dan ganti `SESSION_SECRET` dengan nilai acak panjang.
+1. Salin `.env.example` ke `.env`. Isi `ENCRYPTION_MASTER_KEY` dengan 32 byte hex (`openssl rand -hex 32`), ganti `SESSION_SECRET` dengan nilai acak panjang, lalu isi `BOOTSTRAP_OWNER_EMAIL` dan `BOOTSTRAP_OWNER_PASSWORD` (minimal 12 karakter).
 2. Jalankan `docker compose up --build -d`.
-3. Buat owner pertama melalui terminal API:
+3. API membuat owner awal satu kali dari dua variabel bootstrap saat database masih kosong. Alternatifnya, buat owner interaktif melalui terminal API:
 
    ```sh
    docker compose exec api python -m app.bootstrap --email owner@example.com
    ```
 
-4. Buka `http://localhost:3000` dan masuk dengan kredensial owner.
+4. Buka `http://localhost:3000` dan masuk dengan email/password bootstrap. Tidak ada akun/password default. Setelah owner dibuat, hapus `BOOTSTRAP_OWNER_PASSWORD` dari secret environment dan restart API.
 5. Untuk mode tanpa Docker, jalankan PostgreSQL dan Redis, install `backend[dev,worker]`, jalankan API (`uvicorn app.main:app --reload`), worker (`python -m app.worker`), scheduler (`python -m app.scheduler`), dan frontend (`cd frontend && npm install && npm run dev`).
 
-Database development dibuat otomatis saat API dimulai. Production harus menjalankan migrasi Alembic sebelum service dimulai. Kredensial website hanya dapat dienkripsi setelah `ENCRYPTION_MASTER_KEY` diatur.
+Database development dibuat otomatis saat API dimulai. Production harus menjalankan migrasi Alembic sebelum service dimulai. Kredensial website hanya dapat dienkripsi setelah `ENCRYPTION_MASTER_KEY` diatur. Status setup awal tersedia di `/api/v1/auth/bootstrap/status`; seed tidak mengubah akun yang sudah ada.
 
 ## Konfigurasi website
 
@@ -28,11 +28,11 @@ Daftarkan URL HTTPS, adapter ID, selector login, selector redaksi sensitif, whit
 - Liveness/readiness: `/healthz`, `/readyz`
 - API: `/api/v1` (schema interaktif tersedia di `/docs` pada development)
 - Perintah Telegram: `/help`, `/websites`, `/status`, `/jobs`, `/data`, `/screenshot`, `/test`, `/fill`, `/approve`, `/reject`, `/cancel`, `/schedules`, `/ask`
-- Endpoint bootstrap owner hanya berfungsi pada mode development dan menolak pembuatan akun jika pengguna sudah ada.
+- Bootstrap owner dari environment dapat digunakan pada deployment pertama di development maupun production, hanya saat tabel user masih kosong. Status setup dapat diperiksa di `/api/v1/auth/bootstrap/status`; CLI menolak akun kedua dan pada production memerlukan `--confirm-production`.
 
 ## Secret dan production
 
-Jangan menyimpan `.env` di repositori. Atur kredensial melalui secret manager. Production membutuhkan `SESSION_COOKIE_SECURE=true`, `ENCRYPTION_MASTER_KEY`, `SESSION_SECRET`, TLS, migrasi database, dan object storage persisten untuk artefak. Compose lokal memakai volume artefak; ini bukan pengganti S3-compatible storage untuk deployment. Webhook Telegram harus didaftarkan dengan `TELEGRAM_WEBHOOK_SECRET` dan endpoint HTTPS.
+Jangan menyimpan `.env` di repositori. Atur kredensial melalui secret manager. Hapus `BOOTSTRAP_OWNER_PASSWORD` setelah owner awal dibuat. Production membutuhkan `SESSION_COOKIE_SECURE=true`, `ENCRYPTION_MASTER_KEY`, `SESSION_SECRET`, TLS, migrasi database, dan object storage persisten untuk artefak. Compose lokal memakai volume artefak; ini bukan pengganti S3-compatible storage untuk deployment. Webhook Telegram harus didaftarkan dengan `TELEGRAM_WEBHOOK_SECRET` dan endpoint HTTPS.
 
 ## Validasi
 

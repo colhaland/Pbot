@@ -5,13 +5,17 @@ import pytest
 import pytest_asyncio
 from argon2 import PasswordHasher
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import select
+from pydantic import SecretStr
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app import main
+from app import bootstrap
 from app.crypto import sha256_hex
 from app.db import get_db
-from app.models import Approval, ApprovalStatus, Base, Job, JobStatus, Role, User, Website, WebsiteStatus, utcnow
+from app.models import Approval, ApprovalStatus, Base, Job, JobStatus, Role, TelegramUser, User, Website, WebsiteStatus, utcnow
+from app.settings import Settings
+from app.telegram import create_telegram_job
 
 
 @pytest_asyncio.fixture
@@ -32,7 +36,11 @@ async def client(monkeypatch):
     def accept_test_url(_url):
         return None
 
+    async def allow_test_rate_limit(*_args, **_kwargs):
+        return None
+
     monkeypatch.setattr(main, "_validate_target", accept_test_url)
+    monkeypatch.setattr(main, "enforce_rate_limit", allow_test_rate_limit)
     main.app.dependency_overrides[get_db] = override_get_db
     async with AsyncClient(transport=ASGITransport(app=main.app), base_url="http://test") as http:
         yield http, session_factory
@@ -158,3 +166,47 @@ async def test_cancelled_job_cannot_be_approved(client):
     decision = await http.post(f"/api/v1/approvals/{approval_id}/approve", json={"approval_hash": approval_hash})
     assert decision.status_code == 409
     assert decision.json()["detail"]["code"] == "APPROVAL_ALREADY_DECIDED"
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_owner_can_complete_first_login(client, monkeypatch):
+    http, session_factory = client
+    async with session_factory() as db:
+        await db.execute(delete(User))
+        await db.commit()
+    monkeypatch.setattr(bootstrap, "SessionLocal", session_factory)
+    monkeypatch.setattr(
+        bootstrap,
+        "get_settings",
+        lambda: Settings(
+            bootstrap_owner_email="first.owner@example.test",
+            bootstrap_owner_password=SecretStr("secure-initial-owner-password"),
+        ),
+    )
+    assert await bootstrap.ensure_bootstrap_owner() is True
+    response = await http.post(
+        "/api/v1/auth/login",
+        json={"email": "first.owner@example.test", "password": "secure-initial-owner-password"},
+    )
+    assert response.status_code == 200
+    assert response.json()["user"]["role"] == "owner"
+
+
+@pytest.mark.asyncio
+async def test_replayed_telegram_update_returns_existing_job(client):
+    _, session_factory = client
+    async with session_factory() as db:
+        owner = await db.scalar(select(User).limit(1))
+        website = Website(id="site_tg", name="Portal", base_url="https://portal.example.test", login_url="https://portal.example.test/login", dashboard_url="https://portal.example.test/dashboard", adapter_id="configured_selectors", adapter_version="1.0.0", adapter_config={}, allowed_actions=["extract_data"], status=WebsiteStatus.active)
+        db.add(website)
+        await db.flush()
+        telegram_user = TelegramUser(telegram_user_id=90001, user_id=owner.id, display_name="Operator", role=Role.operator, is_active=True)
+        db.add(telegram_user)
+        await db.flush()
+
+        first = await create_telegram_job(db, telegram_user, website.id, "extract_data", {}, 710001)
+        duplicate = await create_telegram_job(db, telegram_user, website.id, "extract_data", {}, 710001)
+        assert duplicate.id == first.id
+        await db.commit()
+        jobs = (await db.execute(select(Job).where(Job.idempotency_key == "telegram:710001"))).scalars().all()
+        assert len(jobs) == 1

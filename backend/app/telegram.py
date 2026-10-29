@@ -63,6 +63,10 @@ async def rate_limit(user_id: int) -> bool:
 
 
 async def create_telegram_job(db: AsyncSession, telegram_user: TelegramUser, site_id: str, action: str, parameters: dict, update_id: int, *, source: str = "telegram", allow_ai_write: bool = False):
+    idempotency_key = f"telegram:{update_id}"
+    existing = await db.scalar(select(Job).where(Job.idempotency_key == idempotency_key))
+    if existing:
+        return existing
     website = await db.get(Website, site_id)
     if not website or website.status != WebsiteStatus.active:
         raise ValueError("Website tidak aktif atau tidak terdaftar.")
@@ -70,7 +74,7 @@ async def create_telegram_job(db: AsyncSession, telegram_user: TelegramUser, sit
         validated = validate_action(action=action, parameters=parameters, allowed_actions=website.allowed_actions, source="ai" if source == "ai" else "telegram", allow_ai_write_proposals=allow_ai_write)
     except PolicyViolation:
         raise ValueError("Tindakan atau parameter tidak diizinkan untuk website ini.") from None
-    job = Job(website_id=website.id, action=validated.action, risk_level=validated.risk_level, source=source, requested_by=telegram_user.user_id, requested_by_telegram=telegram_user.telegram_user_id, payload=validated.parameters, payload_hash=sha256_hex(json.dumps(validated.parameters, sort_keys=True, separators=(",", ":"))), idempotency_key=f"telegram:{update_id}", adapter_version=website.adapter_version, status=JobStatus.queued)
+    job = Job(website_id=website.id, action=validated.action, risk_level=validated.risk_level, source=source, requested_by=telegram_user.user_id, requested_by_telegram=telegram_user.telegram_user_id, payload=validated.parameters, payload_hash=sha256_hex(json.dumps(validated.parameters, sort_keys=True, separators=(",", ":"))), idempotency_key=idempotency_key, adapter_version=website.adapter_version, status=JobStatus.queued)
     db.add(job)
     audit(db, str(telegram_user.telegram_user_id), "job.created", str(job.id), metadata={"website_id": website.id, "action": action})
     await db.flush()

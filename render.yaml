@@ -39,6 +39,10 @@ services:
         sync: false
       - key: TELEGRAM_WEBHOOK_SECRET
         sync: false
+      - key: BOOTSTRAP_OWNER_EMAIL
+        sync: false
+      - key: BOOTSTRAP_OWNER_PASSWORD
+        sync: false
       - key: PUBLIC_BASE_URL
         sync: false
       - key: ARTIFACT_DIR

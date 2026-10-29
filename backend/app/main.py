@@ -29,6 +29,7 @@ from redis.asyncio import Redis
 from app.crypto import encrypt_secret, sha256_hex
 from app.crypto import decrypt_secret
 from app.ai_gateway import AIGatewayError, interpret as ai_interpret, list_models as ai_list_models
+from app.bootstrap import ensure_bootstrap_owner
 from app.db import create_schema, engine, get_db
 from app.models import (
     Approval,
@@ -61,6 +62,7 @@ _local_rate_limits: dict[str, list[float]] = {}
 async def lifespan(_: FastAPI):
     if settings.app_env == "development":
         await create_schema()
+    await ensure_bootstrap_owner()
     yield
     await engine.dispose()
 
@@ -327,6 +329,21 @@ async def _approval_hash(job: Job, website: Website, preview: dict) -> str:
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok"}
+
+
+@app.get("/api/v1/auth/bootstrap/status")
+async def bootstrap_status(db: AsyncSession = Depends(get_db)):
+    user_count = await db.scalar(select(func.count()).select_from(User))
+    configured = bool(
+        settings.bootstrap_owner_email
+        and settings.bootstrap_owner_password
+        and settings.bootstrap_owner_password.get_secret_value()
+    )
+    return {
+        "initialized": bool(user_count),
+        "bootstrap_configured": configured,
+        "needs_bootstrap": not bool(user_count) and not configured,
+    }
 
 
 @app.get("/readyz")

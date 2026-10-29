@@ -27,6 +27,8 @@ class Settings(BaseSettings):
     telegram_webhook_secret: SecretStr | None = None
     telegram_bot_token: SecretStr | None = None
     gemini_api_key: SecretStr | None = None
+    bootstrap_owner_email: str | None = None
+    bootstrap_owner_password: SecretStr | None = None
 
     def validate_production_secrets(self) -> None:
         if self.app_env == "production":

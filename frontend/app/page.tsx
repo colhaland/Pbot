@@ -29,6 +29,7 @@ import { FormEvent, useCallback, useEffect, useState } from "react";
 
 type Role = "owner" | "operator" | "viewer";
 type User = { id: string; email: string; role: Role };
+type BootstrapStatus = { initialized: boolean; bootstrap_configured: boolean; needs_bootstrap: boolean };
 type Website = {
   id: string;
   name: string;
@@ -61,6 +62,12 @@ type Schedule = { id: string; name: string; website_id: string; action: string; 
 type AISettings = { configured: boolean; api_key_masked: string | null; primary_model_id: string | null; fallback_model_id: string | null; temperature: number; max_output_tokens: number; timeout_seconds: number; mode: string; allow_ai_write_proposals: boolean; system_instruction: string; status: string };
 type AIModel = { id: string; display_name: string; input_token_limit: number | null; output_token_limit: number | null };
 type TelegramUser = { telegram_user_id: number; display_name: string; role: Role; is_active: boolean };
+
+class ApiError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+  }
+}
 
 const navItems: { id: Section; label: string; icon: typeof LayoutDashboard }[] = [
   { id: "overview", label: "Ringkasan", icon: LayoutDashboard },
@@ -107,7 +114,7 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`/api/v1${path}`, { ...init, headers, credentials: "include" });
   if (response.status === 204) return undefined as T;
   const payload = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(payload.detail?.message ?? "Permintaan tidak dapat diproses.");
+  if (!response.ok) throw new ApiError(payload.detail?.message ?? "Permintaan tidak dapat diproses.", response.status);
   return payload as T;
 }
 
@@ -121,6 +128,7 @@ function Badge({ value }: { value: string }) {
 
 export default function Home() {
   const [user, setUser] = useState<User | null>(null);
+    const [bootstrapStatus, setBootstrapStatus] = useState<BootstrapStatus | null>(null);
   const [section, setSection] = useState<Section>("overview");
   const [websites, setWebsites] = useState<Website[]>([]);
   const [jobs, setJobs] = useState<Job[]>([]);
@@ -137,6 +145,7 @@ export default function Home() {
   const [totpRequired, setTotpRequired] = useState(false);
   const [search, setSearch] = useState("");
   const [websiteFormOpen, setWebsiteFormOpen] = useState(false);
+  const [jobFormOpen, setJobFormOpen] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -153,10 +162,16 @@ export default function Home() {
       setSchedules(await api<Schedule[]>("/schedules"));
       setNotice("");
     } catch (error) {
-      if (error instanceof Error && error.message !== "Silakan masuk terlebih dahulu." && !error.message.includes("Sesi")) {
-        setNotice(error.message);
+      if (error instanceof ApiError && error.status === 401) {
+        const setup = await api<BootstrapStatus>("/auth/bootstrap/status").catch(() => null);
+        setBootstrapStatus(setup);
+        setUser(null);
+        if (error.message !== "Silakan masuk terlebih dahulu." && !error.message.includes("Sesi")) {
+          setNotice(error.message);
+        }
+      } else {
+        setNotice(error instanceof Error ? error.message : "Data dashboard sementara tidak tersedia.");
       }
-      setUser(null);
     } finally {
       setLoading(false);
     }
@@ -200,6 +215,7 @@ export default function Home() {
       }
       if (!result.user || !result.csrf_token) throw new Error("Respons login tidak lengkap.");
       window.sessionStorage.setItem("pbot-csrf", result.csrf_token);
+      setBootstrapStatus({ initialized: true, bootstrap_configured: false, needs_bootstrap: false });
       setUser(result.user);
       await refresh();
     } catch (error) {
@@ -273,6 +289,38 @@ export default function Home() {
       setNotice(`Job uji login untuk ${site.name} masuk antrean.`);
       await refresh();
     } catch (error) { setNotice(error instanceof Error ? error.message : "Job tidak dapat dibuat."); }
+  }
+
+  async function submitJob(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    try {
+      const payload = JSON.parse(String(form.get("payload") || "{}"));
+      await api("/jobs", {
+        method: "POST",
+        body: JSON.stringify({
+          website_id: form.get("website_id"),
+          action: form.get("action"),
+          payload,
+          idempotency_key: crypto.randomUUID(),
+        }),
+      });
+      setNotice("Job masuk antrean worker.");
+      setJobFormOpen(false);
+      await refresh();
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Job tidak dapat dibuat.");
+    }
+  }
+
+  async function cancelJob(job: Job) {
+    try {
+      await api(`/jobs/${job.id}/cancel`, { method: "POST", body: "{}" });
+      setNotice(`Permintaan pembatalan job ${job.id.slice(0, 8)} dicatat.`);
+      await refresh();
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Job tidak dapat dibatalkan.");
+    }
   }
 
   async function submitSchedule(event: FormEvent<HTMLFormElement>) {
@@ -371,6 +419,7 @@ export default function Home() {
           <p className="eyebrow">KONSOL OTOMASI</p>
           <h1>Kontrol tetap<br /><em>di tangan Anda.</em></h1>
           <p className="login-copy">Satu ruang kerja untuk memantau website, pekerjaan otomatis, dan setiap perubahan yang menunggu persetujuan.</p>
+          {bootstrapStatus?.needs_bootstrap && <div className="bootstrap-note"><CircleAlert size={16} /><span>Owner awal belum tersedia. Isi <code>BOOTSTRAP_OWNER_EMAIL</code> dan <code>BOOTSTRAP_OWNER_PASSWORD</code> di environment lalu restart API. Tidak ada password default.</span></div>}
           {totpRequired ? <form onSubmit={onVerifyTotp} className="login-form"><label>Kode autentikasi<input name="code" inputMode="numeric" autoComplete="one-time-code" pattern="[0-9]{6}" maxLength={6} placeholder="000000" required /></label>{notice && <p className="form-error">{notice}</p>}<button className="button button-primary button-wide" disabled={loginBusy}>{loginBusy ? "Memverifikasi..." : "Verifikasi dan masuk"}<ArrowRight size={16} /></button></form> : <form onSubmit={onLogin} className="login-form"><label>Email<input name="email" type="email" autoComplete="username" placeholder="nama@perusahaan.id" required /></label><label>Password<input name="password" type="password" autoComplete="current-password" placeholder="Masukkan password" required /></label>{notice && <p className="form-error">{notice}</p>}<button className="button button-primary button-wide" disabled={loginBusy}>{loginBusy ? "Memverifikasi..." : "Masuk ke konsol"}<ArrowRight size={16} /></button></form>}
           <div className="login-foot"><ShieldCheck size={15} /> Kredensial website dienkripsi, tidak ditampilkan ulang.</div>
         </section>
@@ -443,7 +492,11 @@ export default function Home() {
             <section className="surface full-table"><div className="table-toolbar"><div className="search-box"><Search size={16} /><input placeholder="Cari website..." value={search} onChange={(event) => setSearch(event.target.value)} /></div><button className="icon-button" title="Filter"><SlidersHorizontal size={16} /></button></div>{websites.length === 0 ? <EmptyState title="Belum ada website" detail="Website yang Anda daftarkan akan tercatat di sini." /> : <div className="table-wrap"><table><thead><tr><th>NAMA WEBSITE</th><th>ADAPTER</th><th>AKSI DIIZINKAN</th><th>STATUS</th><th>UJI / STATUS</th></tr></thead><tbody>{websites.filter((site) => `${site.name} ${site.id}`.toLowerCase().includes(search.toLowerCase())).map((site) => <tr key={site.id}><td><div className="site-cell"><span className="site-avatar">{site.name.slice(0, 1).toUpperCase()}</span><span><b>{site.name}</b><small>{site.base_url}</small></span></div></td><td><code>{site.adapter_id}</code></td><td>{site.allowed_actions.map((action) => <span key={action} className="action-chip">{actionLabels[action] ?? action}</span>)}</td><td><Badge value={site.status} /></td><td className="table-actions">{user.role !== "viewer" && <button className="button button-quiet button-small" onClick={() => void runLoginTest(site)}>Uji login</button>}{user.role === "owner" && <button className="button button-quiet button-small" onClick={() => void toggleWebsite(site)}>{site.status === "active" ? "Nonaktifkan" : "Aktifkan"}</button>}</td></tr>)}</tbody></table></div>}</section>
           </>}
 
-          {section === "jobs" && <><div className="page-heading"><div><p className="eyebrow">JEJAK EKSEKUSI</p><h1>Riwayat job</h1><p className="page-subtitle">Setiap permintaan, hasil, dan kegagalan tercatat.</p></div><span className="read-only-label"><ShieldCheck size={15} /> Tercatat untuk audit</span></div><section className="surface full-table"><div className="table-toolbar"><div className="search-box"><Search size={16} /><input placeholder="Cari aksi atau website..." value={search} onChange={(event) => setSearch(event.target.value)} /></div><span className="result-count">{filteredJobs.length} aktivitas</span></div>{filteredJobs.length === 0 ? <EmptyState title="Tidak ada job yang cocok" detail="Ubah pencarian atau buat job baru melalui API." /> : <div className="table-wrap"><table><thead><tr><th>AKSI</th><th>WEBSITE</th><th>RISIKO</th><th>STATUS</th><th>WAKTU</th><th></th></tr></thead><tbody>{filteredJobs.map((job) => <tr key={job.id}><td><b>{actionLabels[job.action] ?? job.action}</b><small className="job-id">{job.id}</small></td><td><code>{job.website_id}</code></td><td><span className={`risk-label risk-${job.risk_level}`}>{job.risk_level === "read" ? <ArrowDownRight size={13} /> : <ArrowUpRight size={13} />}{job.risk_level}</span></td><td><Badge value={job.status} /></td><td>{formatTime(job.created_at)}</td><td>{job.last_error_code && <span title={job.last_error_message ?? ""}><CircleAlert size={15} className="error-icon" /></span>}</td></tr>)}</tbody></table></div>}</section></>}
+          {section === "jobs" && <>
+            <div className="page-heading"><div><p className="eyebrow">JEJAK EKSEKUSI</p><h1>Riwayat job</h1><p className="page-subtitle">Setiap permintaan, hasil, dan kegagalan tercatat.</p></div>{user.role !== "viewer" ? <button className="button button-dark" onClick={() => setJobFormOpen((value) => !value)}><Plus size={16} /> Jalankan aksi baca</button> : <span className="read-only-label"><ShieldCheck size={15} /> Tercatat untuk audit</span>}</div>
+            {jobFormOpen && <form className="surface config-form" onSubmit={submitJob}><div className="form-title"><div><p className="eyebrow">JOB MANUAL</p><h2>Aksi baca</h2></div><button type="button" className="icon-button" aria-label="Tutup" onClick={() => setJobFormOpen(false)}><X size={16} /></button></div><div className="form-grid"><label>Website<select name="website_id" required>{websites.filter((site) => site.status === "active").map((site) => <option key={site.id} value={site.id}>{site.name} · {site.id}</option>)}</select></label><label>Aksi<select name="action"><option value="extract_data">Ekstraksi data</option><option value="take_screenshot">Screenshot</option><option value="test_login">Uji login</option></select></label></div><label className="form-block">Parameter JSON<textarea name="payload" rows={3} defaultValue="{}" /></label><div className="form-actions"><button type="button" className="button button-quiet" onClick={() => setJobFormOpen(false)}>Batal</button><button className="button button-dark" type="submit" disabled={!websites.some((site) => site.status === "active")}>Masukkan antrean</button></div></form>}
+            <section className="surface full-table"><div className="table-toolbar"><div className="search-box"><Search size={16} /><input placeholder="Cari aksi atau website..." value={search} onChange={(event) => setSearch(event.target.value)} /></div><span className="result-count">{filteredJobs.length} aktivitas</span></div>{filteredJobs.length === 0 ? <EmptyState title="Tidak ada job yang cocok" detail="Ubah pencarian atau jalankan aksi baca." /> : <div className="table-wrap"><table><thead><tr><th>AKSI</th><th>WEBSITE</th><th>RISIKO</th><th>STATUS</th><th>WAKTU</th><th></th></tr></thead><tbody>{filteredJobs.map((job) => <tr key={job.id}><td><b>{actionLabels[job.action] ?? job.action}</b><small className="job-id">{job.id}</small></td><td><code>{job.website_id}</code></td><td><span className={`risk-label risk-${job.risk_level}`}>{job.risk_level === "read" ? <ArrowDownRight size={13} /> : <ArrowUpRight size={13} />}{job.risk_level}</span></td><td><Badge value={job.status} /></td><td>{formatTime(job.created_at)}</td><td className="table-actions">{job.last_error_code && <span title={job.last_error_message ?? ""}><CircleAlert size={15} className="error-icon" /></span>}{user.role !== "viewer" && ["queued", "running", "executing", "awaiting_approval"].includes(job.status) && <button className="button button-quiet button-small" onClick={() => void cancelJob(job)}>Batalkan</button>}</td></tr>)}</tbody></table></div>}</section>
+          </>}
 
           {section === "approvals" && <><div className="page-heading"><div><p className="eyebrow">HUMAN-IN-THE-LOOP</p><h1>Persetujuan</h1><p className="page-subtitle">Tinjau perubahan sebelum worker mengeksekusinya.</p></div><div className="pending-pill"><span className="pending-dot" />{approvals.length} menunggu</div></div>{approvals.length === 0 ? <section className="surface approval-blank"><span className="empty-check"><Check size={22} /></span><h2>Tidak ada perubahan tertunda</h2><p>Pratinjau perubahan akan muncul di sini sebelum dieksekusi.</p></section> : <div className="approval-page-list">{approvals.map((approval) => <ApprovalCard key={approval.id} approval={approval} onDecide={decide} />)}</div>}</>}
 
